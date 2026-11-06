@@ -1,0 +1,447 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h>
+
+// ==================== PINS ====================
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define SW_PIN 4
+#define SERVO_PIN 26
+#define BUZZER_PIN 23
+#define SWITCH_PIN 19
+#define LED_PIN 18
+#define HEADLIGHT_PIN 25
+
+#define MOTOR_IN3 14
+#define MOTOR_IN4 13
+
+// ==================== SETTINGS ====================
+
+const int DEADZONE = 20;
+const bool FORWARD_WHEN_Y_LOW = true;
+
+const float MAX_FORWARD_SPEED = 100.0;
+const float MAX_REVERSE_SPEED = -50.0;
+
+const float FORWARD_ACCEL = 5.0;
+const float REVERSE_ACCEL = 3.0;
+const float NATURAL_DECEL = 1.0;
+
+const int LIGHT_ON_THRESHOLD = 240;
+const int LIGHT_OFF_THRESHOLD = 250;
+
+bool headlightsOn = false;
+
+const int CENTER_X = 123;
+const int CENTER_Y = 119;
+
+// ==================== COMPONENTS ====================
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Servo myServo;
+
+uint8_t adcAddress = 0;
+
+int joystickX = CENTER_X;
+int joystickY = CENTER_Y;
+int lightLevel = -1;
+
+float speed = 0.0;
+
+// LCD custom arrows
+byte arrowForward[8] = {
+  0b00000,
+  0b00100,
+  0b00010,
+  0b11111,
+  0b00010,
+  0b00100,
+  0b00000,
+  0b00000
+};
+
+byte arrowBackward[8] = {
+  0b00000,
+  0b00100,
+  0b01000,
+  0b11111,
+  0b01000,
+  0b00100,
+  0b00000,
+  0b00000
+};
+
+// ==================== ADS7830 ====================
+
+void findADC() {
+  adcAddress = 0;
+
+  for (uint8_t addr = 0x48; addr <= 0x4B; addr++) {
+    Wire.beginTransmission(addr);
+
+    if (Wire.endTransmission() == 0) {
+      adcAddress = addr;
+
+      Serial.print("ADS7830 found: 0x");
+      Serial.println(addr, HEX);
+      return;
+    }
+  }
+
+  Serial.println("ADS7830 NOT FOUND");
+}
+
+int readADS7830(uint8_t channel) {
+  if (adcAddress == 0 || channel > 7) {
+    return -1;
+  }
+
+  const uint8_t channels[8] = {
+    0, 4, 1, 5, 2, 6, 3, 7
+  };
+
+  uint8_t command = 0x84 | (channels[channel] << 4);
+
+  Wire.beginTransmission(adcAddress);
+  Wire.write(command);
+
+  if (Wire.endTransmission() != 0) {
+    return -1;
+  }
+
+  delayMicroseconds(500);
+
+  if (Wire.requestFrom(adcAddress, (uint8_t)1) != 1) {
+    return -1;
+  }
+
+  return Wire.read();
+}
+
+// ==================== MOTOR ====================
+
+void motorStop() {
+  analogWrite(MOTOR_IN3, 0);
+  analogWrite(MOTOR_IN4, 0);
+}
+
+
+void updateMotor() {
+  int pwm = (int)(abs(speed) / 100.0 * 255.0);
+  pwm = constrain(pwm, 0, 255);
+
+  if (speed > 0) {
+    analogWrite(MOTOR_IN4, 0);
+    analogWrite(MOTOR_IN3, pwm);
+  } else if (speed < 0) {
+    analogWrite(MOTOR_IN3, 0);
+    analogWrite(MOTOR_IN4, pwm);
+  } else {
+    motorStop();
+  }
+}
+
+// ==================== ACCELERATION ====================
+
+void updateSpeed(float dt) {
+  int displacement = joystickY - CENTER_Y;
+
+  // Normalize joystick direction
+  if (FORWARD_WHEN_Y_LOW) {
+    displacement = -displacement;
+  }
+
+  // Joystick acceleration
+  if (abs(displacement) > DEADZONE) {
+
+    float intensity =
+      (abs(displacement) - DEADZONE) / (128.0 - DEADZONE);
+
+    intensity = constrain(intensity, 0.0f, 1.0f);
+
+    if (displacement > 0) {
+      // Forward acceleration
+      speed += FORWARD_ACCEL * intensity * dt;
+    } else {
+      // Reverse acceleration
+      speed -= REVERSE_ACCEL * intensity * dt;
+    }
+  }
+
+  // Natural deceleration always applies
+  if (speed > 0) {
+    speed -= NATURAL_DECEL * dt;
+    if (speed < 0) speed = 0;
+  } else if (speed < 0) {
+    speed += NATURAL_DECEL * dt;
+    if (speed > 0) speed = 0;
+  }
+
+  // Limit speed
+  speed = constrain(
+    speed,
+    MAX_REVERSE_SPEED,
+    MAX_FORWARD_SPEED);
+
+  updateMotor();
+}
+
+// ==================== LCD ====================
+
+void updateLCD() {
+  bool pressed = digitalRead(SW_PIN) == LOW;
+
+  // First row: speed
+  lcd.setCursor(0, 0);
+  lcd.print("               ");
+
+  lcd.setCursor(0, 0);
+  lcd.print("Vitesse: ");
+  lcd.print((int)round(abs(speed)));
+
+  // Direction arrow at top right
+  lcd.setCursor(15, 0);
+
+  if (speed > 0.01) {
+    lcd.write((uint8_t)0);
+  } else if (speed < -0.01) {
+    lcd.write((uint8_t)1);
+  } else {
+    lcd.print("-");
+  }
+
+  // Second row: joystick readings
+  lcd.setCursor(0, 1);
+  lcd.print("                ");
+
+  lcd.setCursor(0, 1);
+  lcd.print("X:");
+  lcd.print(joystickX);
+
+  lcd.print(" Y:");
+  lcd.print(joystickY);
+
+  if (pressed) {
+    lcd.print(" SW");
+  }
+}
+
+bool turnSignalEnabled = false;
+bool ledState = false;
+bool wasActivated = false;
+unsigned long lastChange = 0;
+
+byte bulbIcon[8] = {
+  0b00100,
+  0b01110,
+  0b10001,
+  0b10001,
+  0b01110,
+  0b00100,
+  0b01110,
+  0b00000
+};
+
+void updateHeadlights() {
+  // Ignore invalid ADC readings
+  if (lightLevel < 0) {
+    return;
+  }
+
+  // Dark enough: turn headlights ON
+  if (!headlightsOn && lightLevel <= LIGHT_ON_THRESHOLD) {
+    headlightsOn = true;
+    digitalWrite(HEADLIGHT_PIN, HIGH);
+    Serial.println("Headlights ON");
+  }
+
+  // Bright enough: turn headlights OFF
+  else if (headlightsOn && lightLevel >= LIGHT_OFF_THRESHOLD) {
+    headlightsOn = false;
+    digitalWrite(HEADLIGHT_PIN, LOW);
+    Serial.println("Headlights OFF");
+  }
+}
+
+// ==================== SETUP ====================
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  pinMode(SW_PIN, INPUT_PULLUP);
+
+  // LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+
+  lcd.createChar(0, arrowForward);
+  lcd.createChar(1, arrowBackward);
+
+  // ADC
+  findADC();
+
+  // Servo
+  myServo.setPeriodHertz(50);
+  myServo.attach(SERVO_PIN, 500, 2400);
+  myServo.write(90);
+
+  // Motor
+  pinMode(MOTOR_IN3, OUTPUT);
+  pinMode(MOTOR_IN4, OUTPUT);
+  motorStop();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(SWITCH_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // Create lightbulb icon
+  lcd.createChar(2, bulbIcon);
+
+  // Automatic headlights
+  pinMode(HEADLIGHT_PIN, OUTPUT);
+  digitalWrite(HEADLIGHT_PIN, LOW);
+
+  Serial.println("System started!");
+}
+
+// ==================== LOOP ====================
+
+void loop() {
+  static unsigned long lastRead = 0;
+  static unsigned long lastSpeed = 0;
+  static unsigned long lastServo = 0;
+  static unsigned long lastLCD = 0;
+  static unsigned long lastScan = 0;
+
+  unsigned long now = millis();
+
+
+  // -------- CLIGNOTANT --------
+
+  turnSignalEnabled = digitalRead(SWITCH_PIN) == LOW;
+
+  if (!turnSignalEnabled) {
+    digitalWrite(LED_PIN, LOW);
+    ledState = false;
+    wasActivated = false;
+  } else {
+    if (!wasActivated) {
+      wasActivated = true;
+      ledState = false;
+      lastChange = now;
+      digitalWrite(LED_PIN, LOW);
+    }
+
+    if (!ledState && now - lastChange >= 250) {
+      ledState = true;
+      lastChange = now;
+      digitalWrite(LED_PIN, HIGH);
+    } else if (ledState && now - lastChange >= 500) {
+      ledState = false;
+      lastChange = now;
+      digitalWrite(LED_PIN, LOW);
+    }
+  }
+
+
+  // -------- ADC RECONNECTION --------
+
+  if (adcAddress == 0 && now - lastScan >= 2000) {
+    lastScan = now;
+    findADC();
+  }
+
+  // -------- JOYSTICK READ (10 Hz) --------
+
+  if (now - lastRead >= 100) {
+    lastRead = now;
+
+    int x = readADS7830(1);
+    int y = readADS7830(2);
+    lightLevel = readADS7830(0);  // LDR connected to A0
+    updateHeadlights();
+
+    if (x >= 0) {
+      joystickX = x;
+    }
+
+    // Neutral throttle if ADC fails
+    joystickY = (y >= 0) ? y : CENTER_Y;
+  }
+
+  // -------- SPEED (10 Hz) --------
+
+  if (now - lastSpeed >= 100) {
+    float dt = (now - lastSpeed) / 1000.0;
+    lastSpeed = now;
+
+    updateSpeed(dt);
+  }
+
+  // -------- STEERING (4 Hz) --------
+
+  if (now - lastServo >= 250) {
+    lastServo = now;
+
+    // Preserves your reversed mapping
+    int angle = map(joystickX, 0, 255, 180, 0);
+
+    if (abs(joystickX - 128) <= 8) {
+      angle = 90;
+    }
+
+    myServo.write(angle);
+  }
+
+  // -------- LCD + SERIAL --------
+
+  if (now - lastLCD >= 250) {
+    lastLCD = now;
+
+    updateLCD();
+
+    // Lightbulb icon: bottom-right corner
+    lcd.setCursor(15, 1);
+
+    if (turnSignalEnabled) {
+      lcd.write((uint8_t)2);
+    } else {
+      lcd.print(" ");
+    }
+
+    Serial.print("X: ");
+    Serial.print(joystickX);
+
+    Serial.print(" | Y: ");
+    Serial.print(joystickY);
+
+    Serial.print(" | Speed: ");
+    Serial.print(speed, 2);
+
+    Serial.print(" | Light: ");
+    Serial.println(lightLevel);
+  }
+
+  // -------- KLAXON --------
+  static bool lastHornPressed = false;
+
+  bool hornPressed = digitalRead(SW_PIN) == LOW;
+
+  if (hornPressed != lastHornPressed) {
+    if (hornPressed) {
+      tone(BUZZER_PIN, 1200);
+    } else {
+      noTone(BUZZER_PIN);
+    }
+
+    lastHornPressed = hornPressed;
+  }
+}
