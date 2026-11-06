@@ -1,6 +1,7 @@
 - ESP32 x1
 - Transistor x1
-- Résistances 10k ohms x4
+- Résistances 10k ohms x3
+- Résistance 1k ohms x1
 - Résistance 220 ohms x2
 - DEL jaune x1
 - DEL rouge x1
